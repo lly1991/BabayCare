@@ -101,7 +101,9 @@ class _CupertinoDatePickerSheetState extends State<_CupertinoDatePickerSheet> {
                   minimumDate: widget.minimumDate,
                   maximumDate: widget.maximumDate,
                   use24hFormat: true,
-                  onDateTimeChanged: (value) => setState(() => _value = value),
+                  onDateTimeChanged: (value) {
+                    _value = value;
+                  },
                 ),
               ),
             ],
