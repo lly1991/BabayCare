@@ -14,6 +14,9 @@ class AppDatabase {
     'babycare_db.db',
     'babycare_dbSQLite',
     'babycare_dbSQLite.db',
+    'babycare.db',
+    'babycare.sqlite',
+    'babycare.sqlite3',
   ];
   static const _tables = [
     'users',
@@ -81,10 +84,8 @@ class AppDatabase {
       final targetFile = File(targetPath);
       if (await targetFile.exists()) return;
 
-      final legacyPath = await _findLegacyDbPath(
-        databasesPath: databasesPath,
-        excludePath: targetPath,
-      );
+      final legacyPaths = await findLegacyDbPaths(excludePath: targetPath);
+      final legacyPath = legacyPaths.isEmpty ? null : legacyPaths.first;
       if (legacyPath == null) return;
 
       await targetFile.parent.create(recursive: true);
@@ -107,10 +108,8 @@ class AppDatabase {
       );
       if (currentUsers.isNotEmpty) return;
 
-      final legacyPath = await _findLegacyDbPath(
-        databasesPath: databasesPath,
-        excludePath: currentPath,
-      );
+      final legacyPaths = await findLegacyDbPaths(excludePath: currentPath);
+      final legacyPath = legacyPaths.isEmpty ? null : legacyPaths.first;
       if (legacyPath == null) return;
 
       final legacyDb = await openDatabase(legacyPath, readOnly: true);
@@ -156,18 +155,56 @@ class AppDatabase {
     }
   }
 
-  Future<String?> _findLegacyDbPath({
-    required String databasesPath,
-    required String excludePath,
-  }) async {
-    for (final name in _legacyDbCandidates) {
-      final candidatePath = p.join(databasesPath, name);
-      if (candidatePath == excludePath) continue;
-      if (await File(candidatePath).exists()) {
-        return candidatePath;
+  Future<List<String>> findLegacyDbPaths({String? excludePath}) async {
+    final databasesPath = await getDatabasesPath();
+    final roots = _legacySearchRoots(databasesPath);
+    final results = <String>{};
+
+    for (final root in roots) {
+      final rootDir = Directory(root);
+      if (!await rootDir.exists()) continue;
+
+      for (final name in _legacyDbCandidates) {
+        final candidatePath = p.join(root, name);
+        if (excludePath != null && candidatePath == excludePath) continue;
+        if (await File(candidatePath).exists()) {
+          results.add(candidatePath);
+        }
+      }
+
+      try {
+        await for (final entity in rootDir.list(followLinks: false)) {
+          if (entity is! File) continue;
+          final fileName = p.basename(entity.path).toLowerCase();
+          if (fileName == _dbName.toLowerCase()) continue;
+          if (!fileName.contains('babycare')) continue;
+          final looksLikeDb = fileName.endsWith('.db') ||
+              fileName.endsWith('.sqlite') ||
+              fileName.endsWith('.sqlite3') ||
+              fileName.endsWith('sqlite');
+          if (!looksLikeDb) continue;
+          if (excludePath != null && entity.path == excludePath) continue;
+          results.add(entity.path);
+        }
+      } catch (_) {
+        // Ignore inaccessible directories in best-effort discovery.
       }
     }
-    return null;
+
+    final list = results.toList();
+    list.sort();
+    return list;
+  }
+
+  List<String> _legacySearchRoots(String databasesPath) {
+    final parent = p.dirname(databasesPath);
+    return [
+      databasesPath,
+      p.join(parent, 'files', 'databases'),
+      p.join(parent, 'Library', 'LocalDatabase'),
+      p.join(parent, 'Library', 'Databases'),
+      parent,
+    ];
   }
 
   Future<void> _createBaseTables(DatabaseExecutor db) async {

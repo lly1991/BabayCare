@@ -364,6 +364,87 @@ void main() {
     expect(feedings.first['amount_ml'], 120);
   });
 
+  test('当前库同名用户密码不匹配时，仍可用旧库密码登录并修复', () async {
+    final db = await AppDatabase.instance.database;
+    final currentUserId = await db.insert('users', {
+      'username': 'same_name_user',
+      'password_hash': sha256Hex('new_pass'),
+      'created_at': '2026-03-14T11:30:00.000',
+    });
+
+    final databasesPath = await getDatabasesPath();
+    final legacyPath = p.join(databasesPath, 'babycare_dbSQLite.db');
+    await deleteDatabase(legacyPath);
+
+    final legacyDb = await openDatabase(
+      legacyPath,
+      version: 1,
+      onCreate: (legacyDb, version) async {
+        await _createAllTables(legacyDb);
+      },
+    );
+    await legacyDb.insert('users', {
+      'id': 51,
+      'username': 'same_name_user',
+      'password_hash': sha256Hex('old_pass'),
+      'created_at': '2026-03-14T10:00:00.000',
+    });
+    await legacyDb.insert('babies', {
+      'id': 61,
+      'user_id': 51,
+      'name': 'Legacy Repair Baby',
+      'birth_date': '2025-08-01T00:00:00.000',
+      'gender': 'unknown',
+      'avatar': null,
+      'created_at': '2026-03-14T10:10:00.000',
+    });
+    await legacyDb.insert('feeding_records', {
+      'id': 71,
+      'baby_id': 61,
+      'user_id': 51,
+      'feed_time': '2026-03-12T08:00:00.000',
+      'end_time': null,
+      'feed_type': 'formula',
+      'amount_ml': 130,
+      'duration_min': null,
+      'left_duration': null,
+      'right_duration': null,
+      'brand': null,
+      'notes': null,
+      'created_at': '2026-03-12T08:00:00.000',
+    });
+    await legacyDb.close();
+
+    final loggedIn = await authRepository.login('same_name_user', 'old_pass');
+    expect(loggedIn, isNotNull);
+    expect(loggedIn!.id, currentUserId);
+
+    final userRows = await db.query(
+      'users',
+      where: 'id = ?',
+      whereArgs: [currentUserId],
+      limit: 1,
+    );
+    expect(userRows, isNotEmpty);
+    expect(userRows.first['password_hash'], sha256Hex('old_pass'));
+
+    final babies = await db.query(
+      'babies',
+      where: 'user_id = ?',
+      whereArgs: [currentUserId],
+    );
+    expect(babies.length, 1);
+
+    final babyId = babies.first['id'] as int;
+    final feedingRows = await db.query(
+      'feeding_records',
+      where: 'user_id = ? AND baby_id = ?',
+      whereArgs: [currentUserId, babyId],
+    );
+    expect(feedingRows.length, 1);
+    expect(feedingRows.first['amount_ml'], 130);
+  });
+
   test('数据备份导入可恢复账号、喂养记录和提醒数据', () async {
     final service = BackupService(AppDatabase.instance);
     final payload = jsonEncode({

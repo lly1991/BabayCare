@@ -15,44 +15,64 @@ class AuthRepositoryImpl implements AuthRepository {
   const AuthRepositoryImpl(this._database);
 
   static const _currentDbName = 'babycare_flutter.db';
-  static const _legacyDbCandidates = [
-    'babycare_db',
-    'babycare_db.db',
-    'babycare_dbSQLite',
-    'babycare_dbSQLite.db',
-  ];
 
   final AppDatabase _database;
 
   @override
   Future<AppUser?> login(String username, String password) async {
     final db = await _database.database;
+    final raw = username;
     final normalized = username.trim();
     final passwordHash = sha256Hex(password);
+    final usernameCandidates = <String>{
+      normalized,
+      if (raw != normalized) raw,
+    };
 
-    final rows = await db.query(
-      'users',
-      where: 'username = ?',
-      whereArgs: [normalized],
-      limit: 1,
-    );
-    if (rows.isEmpty) {
-      return _importLegacyUserIfMatched(
-        currentDb: db,
-        username: normalized,
-        password: password,
-        passwordHash: passwordHash,
+    Map<String, Object?>? row;
+    String? matchedUsername;
+    for (final candidate in usernameCandidates) {
+      final found = await _findUserRowByUsername(
+        db: db,
+        username: candidate,
       );
+      if (found != null) {
+        row = found;
+        matchedUsername = candidate;
+        break;
+      }
     }
 
-    final row = rows.first;
+    if (row == null || matchedUsername == null) {
+      for (final candidate in usernameCandidates) {
+        final imported = await _importLegacyUserIfMatched(
+          currentDb: db,
+          username: candidate,
+          password: password,
+          passwordHash: passwordHash,
+        );
+        if (imported != null) return imported;
+      }
+      return null;
+    }
+
     final stored = asString(row['password_hash']);
     final matched = _passwordMatches(
       stored: stored,
       password: password,
       passwordHash: passwordHash,
     );
-    if (!matched) return null;
+    if (!matched) {
+      final repaired = await _repairFromLegacyIfMatched(
+        currentDb: db,
+        currentUserRow: row,
+        username: matchedUsername,
+        password: password,
+        passwordHash: passwordHash,
+      );
+      if (repaired != null) return repaired;
+      return null;
+    }
 
     final user = _map(row);
 
@@ -164,23 +184,21 @@ class AuthRepositoryImpl implements AuthRepository {
   }) async {
     final databasesPath = await getDatabasesPath();
     final currentPath = p.join(databasesPath, _currentDbName);
+    final legacyPaths = await _database.findLegacyDbPaths(
+      excludePath: currentPath,
+    );
 
-    for (final name in _legacyDbCandidates) {
-      final candidatePath = p.join(databasesPath, name);
-      if (candidatePath == currentPath) continue;
+    for (final candidatePath in legacyPaths) {
       if (!await File(candidatePath).exists()) continue;
 
       final legacyDb = await openDatabase(candidatePath, readOnly: true);
       try {
-        final legacyRows = await legacyDb.query(
-          'users',
-          where: 'username = ?',
-          whereArgs: [username],
-          limit: 1,
+        final legacyUser = await _findUserRowByUsername(
+          db: legacyDb,
+          username: username,
         );
-        if (legacyRows.isEmpty) continue;
+        if (legacyUser == null) continue;
 
-        final legacyUser = legacyRows.first;
         final stored = asString(legacyUser['password_hash']);
         final matched = _passwordMatches(
           stored: stored,
@@ -272,5 +290,147 @@ class AuthRepositoryImpl implements AuthRepository {
     }
 
     return null;
+  }
+
+  Future<AppUser?> _repairFromLegacyIfMatched({
+    required Database currentDb,
+    required Map<String, Object?> currentUserRow,
+    required String username,
+    required String password,
+    required String passwordHash,
+  }) async {
+    final databasesPath = await getDatabasesPath();
+    final currentPath = p.join(databasesPath, _currentDbName);
+    final currentUserId = asInt(currentUserRow['id']);
+    final legacyPaths = await _database.findLegacyDbPaths(
+      excludePath: currentPath,
+    );
+
+    for (final candidatePath in legacyPaths) {
+      if (!await File(candidatePath).exists()) continue;
+      final legacyDb = await openDatabase(candidatePath, readOnly: true);
+      try {
+        final legacyUser = await _findUserRowByUsername(
+          db: legacyDb,
+          username: username,
+        );
+        if (legacyUser == null) continue;
+
+        final stored = asString(legacyUser['password_hash']);
+        final matched = _passwordMatches(
+          stored: stored,
+          password: password,
+          passwordHash: passwordHash,
+        );
+        if (!matched) continue;
+
+        final normalizedHash = _normalizePasswordHash(
+          stored: stored,
+          passwordHash: passwordHash,
+        );
+        final legacyUserId = asInt(legacyUser['id']);
+
+        await currentDb.transaction((txn) async {
+          await txn.update(
+            'users',
+            {
+              'password_hash': normalizedHash,
+              if (asString(currentUserRow['created_at']).isEmpty)
+                'created_at': asString(legacyUser['created_at']),
+            },
+            where: 'id = ?',
+            whereArgs: [currentUserId],
+          );
+
+          final hasCurrentBaby = await txn.query(
+            'babies',
+            columns: ['id'],
+            where: 'user_id = ?',
+            whereArgs: [currentUserId],
+            limit: 1,
+          );
+          if (hasCurrentBaby.isNotEmpty) return;
+
+          final legacyBabies = await legacyDb.query(
+            'babies',
+            where: 'user_id = ?',
+            whereArgs: [legacyUserId],
+            orderBy: 'id ASC',
+          );
+          final babyIdMap = <int, int>{};
+          for (final baby in legacyBabies) {
+            final oldBabyId = asInt(baby['id']);
+            final payload = Map<String, Object?>.from(baby)
+              ..remove('id')
+              ..['user_id'] = currentUserId;
+            final newBabyId = await txn.insert('babies', payload);
+            babyIdMap[oldBabyId] = newBabyId;
+          }
+
+          for (final table in const [
+            'feeding_records',
+            'media_records',
+            'sleep_records',
+            'diaper_records',
+            'growth_records',
+          ]) {
+            final rows = await legacyDb.query(
+              table,
+              where: 'user_id = ?',
+              whereArgs: [legacyUserId],
+              orderBy: 'id ASC',
+            );
+            for (final row in rows) {
+              final payload = Map<String, Object?>.from(row)..remove('id');
+              final oldBabyId = payload['baby_id'] as int?;
+              if (oldBabyId != null) {
+                final mappedBabyId = babyIdMap[oldBabyId];
+                if (mappedBabyId == null) continue;
+                payload['baby_id'] = mappedBabyId;
+              }
+              payload['user_id'] = currentUserId;
+              await txn.insert(table, payload);
+            }
+          }
+        });
+
+        final refreshed = await currentDb.query(
+          'users',
+          where: 'id = ?',
+          whereArgs: [currentUserId],
+          limit: 1,
+        );
+        if (refreshed.isEmpty) return null;
+        return _map(refreshed.first);
+      } catch (_) {
+        continue;
+      } finally {
+        await legacyDb.close();
+      }
+    }
+
+    return null;
+  }
+
+  Future<Map<String, Object?>?> _findUserRowByUsername({
+    required DatabaseExecutor db,
+    required String username,
+  }) async {
+    final exact = await db.query(
+      'users',
+      where: 'username = ?',
+      whereArgs: [username],
+      limit: 1,
+    );
+    if (exact.isNotEmpty) return exact.first;
+
+    final caseInsensitive = await db.query(
+      'users',
+      where: 'username = ? COLLATE NOCASE',
+      whereArgs: [username],
+      limit: 1,
+    );
+    if (caseInsensitive.isEmpty) return null;
+    return caseInsensitive.first;
   }
 }
